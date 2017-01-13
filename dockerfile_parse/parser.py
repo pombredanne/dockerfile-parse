@@ -21,6 +21,7 @@ except ImportError:
 
 from .constants import DOCKERFILE_FILENAME
 from .util import b2u, u2b, shlex_split, strip_quotes, remove_quotes, remove_nonescaped_quotes, EnvSubst
+from contextlib import contextmanager
 
 logger = logging.getLogger(__name__)
 
@@ -66,17 +67,32 @@ class Envs(dict):
 
 
 class DockerfileParser(object):
-    def __init__(self, path=None, cache_content=False, env_replace=True):
+    def __init__(self, path=None,
+                 cache_content=False,
+                 env_replace=True,
+                 parent_env=None,
+                 fileobj=None):
         """
-        Initialize path to Dockerfile
+        Initialize source of Dockerfile
         :param path: path to (directory with) Dockerfile
         :param cache_content: cache Dockerfile content inside DockerfileParser
+        :param parent_env: python dict of inherited env vars from parent image
+        :param fileobj: seekable file-like object containing Dockerfile content (will be truncated on write)
         """
-        path = path or '.'
-        if path.endswith(DOCKERFILE_FILENAME):
-            self.dockerfile_path = path
+
+        self.fileobj = fileobj
+
+        if self.fileobj is not None:
+            if path is not None:
+                raise ValueError("Parameters path and fileobj cannot be used together.")
+            else:
+                self.fileobj.seek(0)
         else:
-            self.dockerfile_path = os.path.join(path, DOCKERFILE_FILENAME)
+            path = path or '.'
+            if path.endswith(DOCKERFILE_FILENAME):
+                self.dockerfile_path = path
+            else:
+                self.dockerfile_path = os.path.join(path, DOCKERFILE_FILENAME)
 
         self.cache_content = cache_content
         self.cached_content = ''  # unicode string
@@ -91,6 +107,26 @@ class DockerfileParser(object):
 
         self.env_replace = env_replace
 
+        if isinstance(parent_env, dict):
+            logger.debug("Setting inherited parent image ENV vars: %s", parent_env)
+            self.parent_env = parent_env
+        elif parent_env is not None:
+            assert isinstance(parent_env, dict)
+        else:
+            self.parent_env = {}
+
+    @contextmanager
+    def _open_dockerfile(self, mode):
+        if self.fileobj is not None:
+            self.fileobj.seek(0)
+            if mode == 'w':
+                self.fileobj.truncate()
+            yield self.fileobj
+            self.fileobj.seek(0)
+        else:
+            with open(self.dockerfile_path, mode) as dockerfile:
+                yield dockerfile
+
     @property
     def lines(self):
         """
@@ -100,7 +136,7 @@ class DockerfileParser(object):
             return self.cached_content.splitlines(True)
 
         try:
-            with open(self.dockerfile_path, 'r') as dockerfile:
+            with self._open_dockerfile('r') as dockerfile:
                 lines = [b2u(l) for l in dockerfile.readlines()]
                 if self.cache_content:
                     self.cached_content = ''.join(lines)
@@ -119,7 +155,7 @@ class DockerfileParser(object):
             self.cached_content = ''.join([b2u(l) for l in lines])
 
         try:
-            with open(self.dockerfile_path, 'w') as dockerfile:
+            with self._open_dockerfile('w') as dockerfile:
                 dockerfile.writelines([u2b(l) for l in lines])
         except (IOError, OSError) as ex:
             logger.error("Couldn't write lines to dockerfile: %r", ex)
@@ -134,7 +170,7 @@ class DockerfileParser(object):
             return self.cached_content
 
         try:
-            with open(self.dockerfile_path, 'r') as dockerfile:
+            with self._open_dockerfile('r') as dockerfile:
                 content = b2u(dockerfile.read())
                 if self.cache_content:
                     self.cached_content = content
@@ -153,7 +189,7 @@ class DockerfileParser(object):
             self.cached_content = b2u(content)
 
         try:
-            with open(self.dockerfile_path, 'w') as dockerfile:
+            with self._open_dockerfile('w') as dockerfile:
                 dockerfile.write(u2b(content))
         except (IOError, OSError) as ex:
             logger.error("Couldn't write content to dockerfile: %r", ex)
@@ -189,10 +225,13 @@ class DockerfileParser(object):
         lineno = -1
         insnre = re.compile(r'^\s*(\w+)\s+(.*)$')  # matched group is insn
         contre = re.compile(r'^.*\\\s*$')          # line continues?
+        commentre = re.compile(r'^\s*#')           # line is a comment?
         in_continuation = False
         current_instruction = None
         for line in self.lines:
             lineno += 1
+            if commentre.match(line):
+                continue
             if not in_continuation:
                 m = insnre.match(line)
                 if not m:
@@ -290,7 +329,7 @@ class DockerfileParser(object):
         if name != 'LABEL' and name != 'ENV':
             raise ValueError("Unsupported instruction '%s'", name)
         instructions = {}
-        envs = {}
+        envs = self.parent_env.copy()
         for insndesc in self.structure:
             this_insn = insndesc['instruction']
             if this_insn in (name, 'ENV'):

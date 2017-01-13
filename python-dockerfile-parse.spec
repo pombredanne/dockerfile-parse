@@ -19,12 +19,12 @@
 %global owner DBuildService
 %global project dockerfile-parse
 
-%global commit 36af022e527b0ac74bd27d7c2962207c0fd41632
+%global commit 9d2da5f60f020647651fbc3030c8337ac854438d
 %global shortcommit %(c=%{commit}; echo ${c:0:7})
 
 Name:           python-dockerfile-parse
-Version:        0.0.5
-Release:        3%{?dist}
+Version:        0.0.6
+Release:        1%{?dist}
 
 Summary:        Python library for Dockerfile manipulation
 Group:          Development/Tools
@@ -37,7 +37,7 @@ BuildArch:      noarch
 BuildRequires:  python2-devel
 BuildRequires:  python-setuptools
 %if 0%{?with_check}
-BuildRequires:  pytest
+BuildRequires:  pytest, python-six
 %endif # with_check
 
 Requires:       python-setuptools
@@ -121,6 +121,9 @@ LANG=en_US.utf8 py.test-%{python3_version} -vv tests
 %endif # with_python3
 
 %changelog
+* Tue Dec 20 2016 Tim Waugh <twaugh@redhat.com> - 0.0.6-1
+- 0.0.6
+
 * Fri Nov 20 2015 Jiri Popelka <jpopelka@redhat.com> - 0.0.5-3
 - don't use py3dir
 - new python macros

@@ -9,8 +9,13 @@ of the BSD license. See the LICENSE file for details.
 
 from __future__ import unicode_literals
 
+import inspect
 import json
+import os
 import pytest
+import re
+import six
+import sys
 
 from dockerfile_parse import DockerfileParser
 from tests.fixtures import dfparser, instruction
@@ -19,6 +24,26 @@ NON_ASCII = "žluťoučký"
 
 
 class TestDockerfileParser(object):
+    def test_all_versions_match(self):
+        def read_version(fp, regex):
+            with open(fp, "r") as fd:
+                content = fd.read()
+                found = re.findall(regex, content)
+                if len(found) == 1:
+                    return found[0]
+                else:
+                    raise Exception("Version not found!")
+
+        import dockerfile_parse
+        from dockerfile_parse import __version__ as module_version
+        fp = inspect.getfile(dockerfile_parse)
+        project_dir = os.path.dirname(os.path.dirname(fp))
+        specfile = os.path.join(project_dir, "python-dockerfile-parse.spec")
+        setup_py = os.path.join(project_dir, "setup.py")
+        spec_version = read_version(specfile, r"\nVersion:\s*(.+?)\s*\n")
+        setup_py_version = read_version(setup_py, r"version=['\"](.+)['\"]")
+        assert spec_version == module_version
+        assert setup_py_version == module_version
 
     def test_dockerfileparser(self, dfparser):
         df_content = """\
@@ -50,8 +75,16 @@ CMD {0}""".format(NON_ASCII)
                           "   base\n",          # extra ws, continuation line
                           " # comment\n",
                           " label  foo  \\\n",  # extra ws
+                          "    # comment\n",    # should be ignored
                           "    bar  \n",        # extra ws, continuation line
-                          "USER  {0}".format(NON_ASCII)]   # extra ws, no newline
+                          "USER  {0}\n".format(NON_ASCII),
+                          "# comment \\\n",     # extra ws
+                          "# comment \\ \n",    # extra ws with a space
+                          "# comment \\\\ \n",  # two backslashes
+                          "RUN command1\n",
+                          "RUN command2 && \\\n",
+                          "    # comment\n",
+                          "    command3\n"]
 
         assert dfparser.structure == [{'instruction': 'FROM',
                                        'startline': 1,  # 0-based
@@ -60,14 +93,24 @@ CMD {0}""".format(NON_ASCII)
                                        'value': 'base'},
                                       {'instruction': 'LABEL',
                                        'startline': 4,
-                                       'endline': 5,
+                                       'endline': 6,
                                        'content': ' label  foo  \\\n    bar  \n',
                                        'value': 'foo      bar'},
                                       {'instruction': 'USER',
-                                       'startline': 6,
-                                       'endline': 6,
-                                       'content': 'USER  {0}'.format(NON_ASCII),
-                                       'value': '{0}'.format(NON_ASCII)}]
+                                       'startline': 7,
+                                       'endline': 7,
+                                       'content': 'USER  {0}\n'.format(NON_ASCII),
+                                       'value': '{0}'.format(NON_ASCII)},
+                                      {'instruction': 'RUN',
+                                       'startline': 11,
+                                       'endline': 11,
+                                       'content': 'RUN command1\n',
+                                       'value': 'command1'},
+                                      {'instruction': 'RUN',
+                                       'startline': 12,
+                                       'endline': 14,
+                                       'content': 'RUN command2 && \\\n    command3\n',
+                                       'value': 'command2 &&     command3'}]
 
     def test_dockerfile_json(self, dfparser):
         dfparser.content = """\
@@ -85,6 +128,34 @@ USER  {0}""".format(NON_ASCII)
                           "LABEL a b\n"]
         base_img = dfparser.baseimage
         assert base_img.startswith('fedora')
+
+    def test_get_parent_env(self, tmpdir):
+        tmpdir_path = str(tmpdir.realpath())
+        p_env = {"bar": "baz"}
+        df1 = DockerfileParser(tmpdir_path, env_replace=True, parent_env=p_env)
+        df1.lines = [
+            "FROM parent\n",
+            "ENV foo=\"$bar\"\n",
+            "LABEL label=\"$foo $bar\"\n"
+        ]
+
+        # Even though we inherit an ENV, this .envs count should only be for the
+        # ENVs defined in *this* Dockerfile as we're parsing the Dockerfile and
+        # the parent_env is only to satisfy use of inhereted ENVs.
+        assert len(df1.envs) == 1
+        assert df1.envs.get('foo') == 'baz'
+        assert len(df1.labels) == 1
+        assert df1.labels.get('label') == 'baz baz'
+
+    def test_get_parent_env_from_scratch(self, tmpdir):
+        tmpdir_path = str(tmpdir.realpath())
+        p_env = {"bar": "baz"}
+        df1 = DockerfileParser(tmpdir_path, env_replace=True, parent_env=p_env)
+        df1.lines = [
+            "FROM scratch\n",
+        ]
+
+        assert not df1.envs
 
     def test_get_instructions_from_df(self, dfparser, instruction):
         dfparser.content = ""
@@ -189,8 +260,7 @@ ENV j='k' l=m
 
     @pytest.mark.parametrize(('existing',
                               'delete_key',
-                              'expected',
-    ), [
+                              'expected'), [
         # Delete non-existing key
         (['a b\n',
           'x="y z"\n'],
@@ -242,8 +312,7 @@ ENV j='k' l=m
 
     @pytest.mark.parametrize(('existing',
                               'new',
-                              'expected',
-    ), [
+                              'expected'), [
         # Simple test: set an instruction
         (['a b\n',
           'x="y z"\n'],
@@ -423,3 +492,11 @@ ENV e=\"f g\"
                           "ENV V=v\n",
                           "LABEL TEST={0}\n".format(label)]
         assert dfparser.labels['TEST'] == expected
+
+    def test_path_and_fileobj_together(self):
+        with pytest.raises(ValueError):
+            DockerfileParser(path='.', fileobj=six.StringIO())
+
+    def test_nonseekable_fileobj(self):
+        with pytest.raises(AttributeError):
+            DockerfileParser(fileobj=sys.stdin)
