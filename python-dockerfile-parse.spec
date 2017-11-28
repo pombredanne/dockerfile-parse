@@ -19,11 +19,11 @@
 %global srcname dockerfile-parse
 %global modname %(n=%{srcname}; echo ${n//-/_})
 
-%global commit 9d2da5f60f020647651fbc3030c8337ac854438d
+%global commit 8d2abe90884fa5a61f23b3381c41d8a733efdfaf
 %global shortcommit %(c=%{commit}; echo ${c:0:7})
 
 Name:           python-%{srcname}
-Version:        0.0.6
+Version:        0.0.7
 Release:        1%{?dist}
 
 Summary:        Python library for Dockerfile manipulation
@@ -109,6 +109,9 @@ py.test-%{python3_version} -v tests
 %endif
 
 %changelog
+* Mon May 22 2017 Tim Waugh <twaugh@redhat.com> - 0.0.7-1
+- 0.0.7
+
 * Fri Feb  3 2017 Tim Waugh <twaugh@redhat.com>
 - Incorporate modernisations from Fedora spec file.
 
