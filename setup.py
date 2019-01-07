@@ -28,7 +28,7 @@ def _install_requirements():
 
 setup(
     name='dockerfile-parse',
-    version='0.0.8',
+    version='0.0.13',
     description='Python library for Dockerfile manipulation',
     author='Jiri Popelka',
     author_email='jpopelka@redhat.com',
@@ -37,5 +37,22 @@ setup(
     packages=find_packages(exclude=["tests"]),
     install_requires=_install_requirements(),
     tests_require=_get_requirements('tests/requirements.txt'),
+    classifiers=[
+        'Development Status :: 5 - Production/Stable',
+        'Environment :: Other Environment',
+        'Intended Audience :: Developers',
+        'License :: OSI Approved :: BSD License',
+        'Operating System :: OS Independent',
+        'Programming Language :: Python',
+        'Programming Language :: Python :: 2',
+        'Programming Language :: Python :: 2.7',
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.4',
+        'Programming Language :: Python :: 3.5',
+        'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: Implementation :: CPython',
+        'Topic :: Software Development :: Libraries :: Python Modules'
+    ],
 )
 

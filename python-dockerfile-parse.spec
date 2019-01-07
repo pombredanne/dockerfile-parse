@@ -19,11 +19,11 @@
 %global srcname dockerfile-parse
 %global modname %(n=%{srcname}; echo ${n//-/_})
 
-%global commit 42576486868374308e00ee3690bfe6793e346325
+%global commit 12c98a41df39d54040e8128d25482b3c12815751
 %global shortcommit %(c=%{commit}; echo ${c:0:7})
 
 Name:           python-%{srcname}
-Version:        0.0.8
+Version:        0.0.13
 Release:        1%{?dist}
 
 Summary:        Python library for Dockerfile manipulation
@@ -46,6 +46,7 @@ BuildRequires:  pytest
 %else
 BuildRequires:  python2-pytest
 %endif
+Requires: %{py2name}-six
 
 %description -n python2-%{srcname}
 %{summary}.
@@ -61,6 +62,7 @@ BuildRequires:  python3-setuptools
 %if %{with tests}
 BuildRequires:  python3-six, python3-pytest
 %endif
+Requires: python3-six
 
 %description -n python3-%{srcname}
 %{summary}.
@@ -109,6 +111,21 @@ py.test-%{python3_version} -v tests
 %endif
 
 %changelog
+* Wed Nov 14 2018 Robert Cerven <rcerven@redhat.com> - 0.0.13-1
+- new upstream release: 0.0.13
+
+* Fri Oct 05 2018 Robert Cerven <rcerven@redhat.com> - 0.0.12-1
+- new upstream release: 0.0.12
+
+* Wed Jun 13 2018 Robert Cerven <rcerven@redhat.com> - 0.0.11-1
+- new upstream release: 0.0.11
+
+* Fri Mar 23 2018 Robert Cerven <rcerven@redhat.com> - 0.0.10-1
+- new upstream release: 0.0.10
+
+* Mon Feb 12 2018 Robert Cerven <rcerven@redhat.com> - 0.0.9-1
+- new upstream release: 0.0.9
+
 * Tue Jan 16 2018 Robert Cerven <rcerven@redhat.com> - 0.0.8-1
 - new upstream release: 0.0.8
 

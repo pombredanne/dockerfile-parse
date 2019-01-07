@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Copyright (c) 2015 Red Hat, Inc
+Copyright (c) 2015, 2018 Red Hat, Inc
 All rights reserved.
 
 This software may be modified and distributed under the terms
@@ -14,10 +14,11 @@ import logging
 import os
 import re
 from contextlib import contextmanager
+from six import string_types
 
 from .constants import DOCKERFILE_FILENAME
 from .util import (b2u, extract_labels_or_envs, get_key_val_dictionary,
-                   remove_quotes, shlex_split, u2b, Context)
+                   u2b, Context, WordSplitter)
 
 try:
     # py3
@@ -80,7 +81,8 @@ class DockerfileParser(object):
         :param path: path to (directory with) Dockerfile
         :param cache_content: cache Dockerfile content inside DockerfileParser
         :param parent_env: python dict of inherited env vars from parent image
-        :param fileobj: seekable file-like object containing Dockerfile content (will be truncated on write)
+        :param fileobj: seekable file-like object containing Dockerfile content
+                        as bytes (will be truncated on write)
         """
 
         self.fileobj = fileobj
@@ -110,13 +112,12 @@ class DockerfileParser(object):
 
         self.env_replace = env_replace
 
-        if isinstance(parent_env, dict):
+        if parent_env is None:
+            self.parent_env = {}
+        else:
+            assert isinstance(parent_env, dict)
             logger.debug("Setting inherited parent image ENV vars: %s", parent_env)
             self.parent_env = parent_env
-        elif parent_env is not None:
-            assert isinstance(parent_env, dict)
-        else:
-            self.parent_env = {}
 
     @contextmanager
     def _open_dockerfile(self, mode):
@@ -267,43 +268,109 @@ class DockerfileParser(object):
         return json.dumps(insndescs)
 
     @property
+    def parent_images(self):
+        """
+        :return: list of parent images -- one image per each stage's FROM instruction
+        """
+        parents = []
+        for instr in self.structure:
+            if instr['instruction'] != 'FROM':
+                continue
+            image, _ = image_from(instr['value'])
+            if image is not None:
+                parents.append(image)
+        return parents
+
+    @parent_images.setter
+    def parent_images(self, parents):
+        """
+        setter for images in 'FROM' instructions.
+        Images are updated per build stage with the given parents in the order they appear.
+        Raises RuntimeError if a different number of parents are given than there are stages
+        as that is likely to be a mistake.
+
+        :param parents: list of image strings
+        """
+        parents = list(parents)
+        change_instrs = []
+        for instr in self.structure:
+            if instr['instruction'] != 'FROM':
+                continue
+
+            old_image, stage = image_from(instr['value'])
+            if not old_image:
+                continue  # broken FROM, fixing would just confuse things
+            if not parents:
+                raise RuntimeError("not enough parents to match build stages")
+
+            image = parents.pop(0)
+            if image != old_image:
+                instr['value'] = '{0} AS {1}'.format(image, stage) if stage else image
+                instr['content'] = 'FROM {0}\n'.format(instr['value'])
+                change_instrs.append(instr)
+
+        if parents:
+            raise RuntimeError("trying to update too many parents for build stages")
+
+        lines = self.lines
+        for instr in reversed(change_instrs):
+            lines[instr['startline']:instr['endline']+1] = [instr['content']]
+
+        self.lines = lines
+
+    @property
+    def is_multistage(self):
+        return len(self.parent_images) > 1
+
+    @property
     def baseimage(self):
         """
-        :return: base image, i.e. value of FROM instruction
+        :return: base image, i.e. value of final stage FROM instruction
         """
-        for insndesc in self.structure:
-            if insndesc['instruction'] == 'FROM':
-                return insndesc['value']
-        return None
+        return (self.parent_images or [None])[-1]
 
     @baseimage.setter
-    def baseimage(self, value):
+    def baseimage(self, new_image):
         """
-        setter for 'FROM' instruction
-
+        change image of final stage FROM instruction
         """
-        self._modify_instruction('FROM', value)
+        images = self.parent_images or [None]
+        images[-1] = new_image
+        self.parent_images = images
 
     @property
     def cmd(self):
         """
-        There can only be one CMD instruction in a Dockerfile.
-        If there's more than one CMD then only the last CMD takes effect.
-        :return: value of last CMD instruction
+        Determine the final CMD instruction, if any, in the final build stage.
+        CMDs from earlier stages are ignored.
+        :return: value of final stage CMD instruction
         """
         value = None
         for insndesc in self.structure:
-            if insndesc['instruction'] == 'CMD':
+            if insndesc['instruction'] == 'FROM':  # new stage, reset
+                value = None
+            elif insndesc['instruction'] == 'CMD':
                 value = insndesc['value']
         return value
 
     @cmd.setter
     def cmd(self, value):
         """
-        setter for 'CMD' instruction
+        setter for final 'CMD' instruction in final build stage
 
         """
-        self._modify_instruction('CMD', value)
+        cmd = None
+        for insndesc in self.structure:
+            if insndesc['instruction'] == 'FROM':  # new stage, reset
+                cmd = None
+            elif insndesc['instruction'] == 'CMD':
+                cmd = insndesc
+
+        new_cmd = 'CMD ' + value
+        if cmd:
+            self.add_lines_at(cmd, new_cmd, replace=True)
+        else:
+            self.add_lines(new_cmd)
 
     @property
     def labels(self):
@@ -332,11 +399,14 @@ class DockerfileParser(object):
         if name != 'LABEL' and name != 'ENV':
             raise ValueError("Unsupported instruction '%s'", name)
         instructions = {}
-        envs = self.parent_env.copy()
+        envs = {}
 
         for instruction_desc in self.structure:
             this_instruction = instruction_desc['instruction']
-            if this_instruction in (name, 'ENV'):
+            if this_instruction == 'FROM':
+                instructions.clear()
+                envs = self.parent_env.copy()
+            elif this_instruction in (name, 'ENV'):
                 logger.debug("%s value: %r", name.lower(), instruction_desc['value'])
                 key_val_list = extract_labels_or_envs(env_replace=env_replace,
                                                       envs=envs,
@@ -417,24 +487,30 @@ class DockerfileParser(object):
         if instr_key not in instructions:
             raise KeyError('%s not in %ss' % (instr_key, instruction))
 
-        # Find where in the file to put the next release
+        # extract target instructions from the final stage only
+        candidates = []
+        for insn in self.structure:
+            if insn['instruction'] == 'FROM':
+                candidates = []
+            if insn['instruction'] == instruction:
+                candidates.append(insn)
+
+        # Find where in the file to put the changes
         content = startline = endline = None
-        for candidate in [insn for insn in self.structure
-                          if insn['instruction'] == instruction]:
-            splits = shlex_split(candidate['value'])
+        for candidate in candidates:
+            words = list(WordSplitter(candidate['value']).split(dequote=False))
 
             # LABEL/ENV syntax is one of two types:
-            if '=' not in splits[0]:  # LABEL/ENV name value
-                # remove (double-)quotes
-                value = remove_quotes(candidate['value'])
-                words = value.split(None, 1)
-                if words[0] == instr_key:
+            if '=' not in words[0]:  # LABEL/ENV name value
+                # Remove quotes from key name and see if it's the one
+                # we're looking for.
+                if WordSplitter(words[0]).dequote() == instr_key:
                     if instr_value is None:
                         # Delete this line altogether
                         content = None
                     else:
                         # Adjust label/env value
-                        words[1] = quote(instr_value)
+                        words[1:] = [quote(instr_value)]
 
                         # Now reconstruct the line
                         content = " ".join([instruction] + words) + '\n'
@@ -443,26 +519,23 @@ class DockerfileParser(object):
                     endline = candidate['endline']
                     break
             else:  # LABEL/ENV "name"="value"
-                for index, token in enumerate(splits):
-                    words = token.split("=", 1)
-                    if words[0] == instr_key:
+                for index, token in enumerate(words):
+                    key, _ = token.split("=", 1)
+                    if WordSplitter(key).dequote() == instr_key:
                         if instr_value is None:
                             # Delete this label
-                            del splits[index]
+                            del words[index]
                         else:
                             # Adjust label/env value
-                            words[1] = instr_value
-                            splits[index] = "=".join(words)
+                            words[index] = "{0}={1}".format(key,
+                                                            quote(instr_value))
 
-                        if len(splits) == 0:
+                        if len(words) == 0:
                             # We removed the last label/env, delete the whole line
                             content = None
                         else:
-                            instrs = [x.split('=', 1) for x in splits]
-                            quoted_instrs = ['='.join(map(quote, x))
-                                             for x in instrs]
                             # Now reconstruct the line
-                            content = " ".join([instruction] + quoted_instrs) + '\n'
+                            content = " ".join([instruction] + words) + '\n'
 
                         startline = candidate['startline']
                         endline = candidate['endline']
@@ -477,25 +550,6 @@ class DockerfileParser(object):
         if content:
             lines.insert(startline, content)
         self.lines = lines
-
-    def _modify_instruction(self, instruction, new_value):
-        """
-        :param instruction: like 'FROM' or 'CMD'
-        :param new_value: new value of instruction
-        """
-        if instruction == 'LABEL':
-            raise ValueError('Please use labels.setter')
-        if instruction == 'ENV':
-            raise ValueError('Please use envs.setter')
-        for insn in self.structure:
-            if insn['instruction'] == instruction:
-                new_line = '{0} {1}\n'.format(instruction, new_value)
-                lines = self.lines
-                del lines[insn['startline']:insn['endline'] + 1]
-                lines.insert(insn['startline'], new_line)
-                self.lines = lines
-                if instruction == 'FROM':  # Only overwrite first base-image
-                    return
 
     def _delete_instructions(self, instruction, value=None):
         """
@@ -532,8 +586,94 @@ class DockerfileParser(object):
             new_line = '{0} {1}\n'.format(instruction, value)
         if new_line:
             lines = self.lines
+            if not lines[len(lines) - 1].endswith('\n'):
+                new_line = '\n' + new_line
             lines += new_line
             self.lines = lines
+
+    def add_lines(self, *lines, **kwargs):
+        """
+        Add lines to the beginning or end of the build.
+        :param lines: one or more lines to add to the content, by default at the end.
+        :param all_stages: bool for whether to add in all stages for a multistage build
+                           or (by default) only the last.
+        :param at_start: adds at the beginning (after FROM) of the stage(s) instead of the end.
+        :param skip_scratch: skip stages which use "FROM scratch"
+        """
+        assert len(lines) > 0
+        lines = [_endline(line) for line in lines]
+        all_stages = kwargs.pop('all_stages', False)
+        at_start = kwargs.pop('at_start', False)
+        skip_scratch = kwargs.pop('skip_scratch', False)
+        assert not kwargs, "Unknown keyword argument(s): {0}".format(kwargs.keys())
+
+        froms = [
+            instr for instr in self.structure
+            if instr['instruction'] == 'FROM'
+        ] or [{'endline': -1}]  # no FROM? fake one before the beginning
+        if not all_stages:  # only modify the last
+            froms = [froms[-1]]
+
+        df_lines = self.lines
+        # make sure last line has a newline if lines are to be appended
+        if df_lines and not at_start:
+            df_lines[-1] = _endline(df_lines[-1])
+
+        # iterate through the stages in reverse order
+        # so adding lines doesn't invalidate line numbers from structure dicts.
+        # first add a bogus instruction to represent EOF in our iteration.
+        froms.append({'startline': len(df_lines) + 1})
+        for stage in range(len(froms)-2, -1, -1):  # e.g. 0 for single or 2, 1, 0 for 3 stages
+            start, finish = froms[stage], froms[stage+1]
+            linenum = start['endline'] + 1 if at_start else finish['startline']
+            if skip_scratch and froms[stage]['value'] == 'scratch':
+                continue
+            df_lines[linenum:linenum] = lines
+
+        self.lines = df_lines
+
+    def add_lines_at(self, anchor, *lines, **kwargs):
+        """
+        Add lines at a specific location in the file.
+        :param anchor: structure_dict|line_str|line_num a reference to where adds should occur
+        :param lines: one or more lines to add to the content
+        :param replace: if True -- replace the anchor
+        :param after: if True -- insert after the anchor (conflicts with "replace")
+        """
+        assert len(lines) > 0
+        replace = kwargs.pop('replace', False)
+        after = kwargs.pop('after', False)
+        assert not (after and replace)
+        assert not kwargs, "Unknown keyword argument(s): {0}".format(kwargs.keys())
+
+        # find the line number for the insertion
+        df_lines = self.lines
+        if isinstance(anchor, int):  # line number, just validate
+            assert anchor in range(len(df_lines))
+            if replace:
+                del df_lines[anchor]
+        elif isinstance(anchor, dict):  # structure
+            assert anchor in self.structure, "Current structure does not match: {0}".format(anchor)
+            if replace:
+                df_lines[anchor['startline']:anchor['endline'] + 1] = []
+            anchor = anchor['startline']
+        elif isinstance(anchor, string_types):  # line contents
+            matches = [index for index, text in enumerate(df_lines) if text == anchor]
+            if not matches:
+                raise RuntimeError("Cannot find line in the build file:\n" + anchor)
+            anchor = matches[-1]
+            if replace:
+                del df_lines[anchor]
+        else:
+            raise RuntimeError("Unknown anchor type {0}".format(anchor))
+
+        if after:
+            # ensure there's a newline on final line
+            df_lines[anchor] = _endline(df_lines[anchor])
+            anchor += 1
+
+        df_lines[anchor:anchor] = [_endline(line) for line in lines]
+        self.lines = df_lines
 
     @property
     def context_structure(self):
@@ -544,9 +684,13 @@ class DockerfileParser(object):
         instructions = []
         last_context = Context()
         for instr in self.structure:
+            instruction_type = instr['instruction']
+            if instruction_type == "FROM":  # reset per stage
+                last_context = Context()
+
             context = Context(envs=dict(last_context.envs),
                               labels=dict(last_context.labels))
-            instruction_type = instr['instruction']
+
             if instruction_type in ["ENV", "LABEL"]:
                 val = get_key_val_dictionary(instruction_value=instr['value'],
                                              env_replace=self.env_replace,
@@ -556,3 +700,28 @@ class DockerfileParser(object):
             instructions.append(context)
             last_context = context
         return instructions
+
+
+def image_from(from_value):
+    """
+    :param from_value: string like "image:tag" or "image:tag AS name"
+    :return: tuple of the image and stage name, e.g. ("image:tag", None)
+    """
+    regex = re.compile(r"""(?xi)     # readable, case-insensitive regex
+        \s*                          # ignore leading whitespace
+        (?P<image> \S+ )             # image and optional tag
+        (?:                          # optional "AS name" clause for stage
+            \s+ AS \s+
+            (?P<name> \S+ )
+        )?
+        """)
+    match = re.match(regex, from_value)
+    return match.group('image', 'name') if match else (None, None)
+
+
+def _endline(line):
+    """
+    Make sure the line ends with a single newline.
+    Since trailing whitespace has no significance, remove it.
+    """
+    return line.rstrip() + '\n'

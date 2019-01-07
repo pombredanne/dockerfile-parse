@@ -19,9 +19,13 @@ import sys
 from textwrap import dedent
 
 from dockerfile_parse import DockerfileParser
+from dockerfile_parse.parser import image_from
 from tests.fixtures import dfparser, instruction
 
 NON_ASCII = "žluťoučký"
+# flake8 does not understand fixtures:
+dfparser = dfparser
+instruction = instruction
 
 
 class TestDockerfileParser(object):
@@ -133,6 +137,56 @@ class TestDockerfileParser(object):
                                {"USER": "{0}".format(NON_ASCII)}])
         assert dfparser.json == expected
 
+    def test_multistage_dockerfile(self, dfparser):
+        dfparser.content = dedent("""\
+            From builder:image AS builder
+            RUN compile to /spam/eggs
+
+            FROM base
+            COPY --from=builder /spam/eggs /usr/bin/eggs
+            """)
+        expected = [
+            {
+                'instruction': 'FROM',
+                'value': 'builder:image AS builder',
+                'startline': 0,  # 0-based
+                'endline': 0,
+                'content': 'From builder:image AS builder\n',
+            }, {
+                'instruction': 'RUN',
+                'value': 'compile to /spam/eggs',
+                'startline': 1,
+                'endline': 1,
+                'content': 'RUN compile to /spam/eggs\n',
+            }, {
+                'instruction': 'FROM',
+                'value': 'base',
+                'startline': 3,
+                'endline': 3,
+                'content': 'FROM base\n',
+            }, {
+                'instruction': 'COPY',
+                'value': '--from=builder /spam/eggs /usr/bin/eggs',
+                'startline': 4,
+                'endline': 4,
+                'content': 'COPY --from=builder /spam/eggs /usr/bin/eggs\n',
+            },
+        ]
+        assert dfparser.structure == expected
+        assert dfparser.baseimage == 'base'
+        assert dfparser.is_multistage
+
+    def test_multistage_dockerfile_labels(self, dfparser):
+        dfparser.content = dedent("""\
+            From builder:image AS builder
+            LABEL "spam=baked beans"
+
+            FROM base
+            LABEL "eggs=bacon"
+            """)
+        # only labels from final stage should count
+        assert dfparser.labels == {'eggs': 'bacon'}
+
     def test_get_baseimg_from_df(self, dfparser):
         dfparser.lines = ["From fedora:latest\n",
                           "LABEL a b\n"]
@@ -151,7 +205,7 @@ class TestDockerfileParser(object):
 
         # Even though we inherit an ENV, this .envs count should only be for the
         # ENVs defined in *this* Dockerfile as we're parsing the Dockerfile and
-        # the parent_env is only to satisfy use of inhereted ENVs.
+        # the parent_env is only to satisfy use of inherited ENVs.
         assert len(df1.envs) == 1
         assert df1.envs.get('foo') == 'baz'
         assert len(df1.labels) == 1
@@ -167,58 +221,104 @@ class TestDockerfileParser(object):
 
         assert not df1.envs
 
-    def test_get_instructions_from_df(self, dfparser, instruction):
-        dfparser.content = ""
-        lines = []
-        i = instruction
-        lines.insert(-1, '{0} "name1"=\'value 1\' "name2"=myself name3=""\n'.format(i))
-        lines.insert(-1, '{0} name5=5\n'.format(i))
-        lines.insert(-1, '{0} "name6"=6\n'.format(i))
-        lines.insert(-1, '{0} name7\n'.format(i))
-        lines.insert(-1, '{0} "name8"\n'.format(i))
-        lines.insert(-1, '{0} "name9"="asd \\  \\n qwe"\n'.format(i))
-        lines.insert(-1, '{0} "name10"="{1}"\n'.format(i, NON_ASCII))
-        lines.insert(-1, '{0} "name1 1"=1\n'.format(i))
-        lines.insert(-1, '{0} "name12"=12 \ \n   "name13"=13\n'.format(i))
-        lines.insert(-1, '{0} name14=1\ 4\n'.format(i))
-        lines.insert(-1, '{0} name15="with = in value"\n'.format(i))
+    @pytest.mark.parametrize(('instr_value', 'expected'), [
+        ('"name1"=\'value 1\' "name2"=myself name3=""',
+         {'name1': 'value 1',
+          'name2': 'myself',
+          'name3': ''}),
+        ('name5=5', {'name5': '5'}),
+        ('"name6"=6', {'name6': '6'}),
+        ('name7', {'name7': ''}),
+        ('"name8"', {'name8': ''}),
+        ('"name9"="asd \\  \\n qwe"', {'name9': 'asd \\  \\n qwe'}),
+        ('"name10"="{0}"'.format(NON_ASCII), {'name10': NON_ASCII}),
+        ('"name1 1"=1', {'name1 1': '1'}),
+        ('"name12"=12 \ \n   "name13"=13', {'name12': '12', 'name13': '13'}),
+        ('name14=1\ 4', {'name14': '1 4'}),
+        ('name15="with = in value"', {'name15': 'with = in value'}),
         # old syntax (without =)
-        lines.insert(-1, '{0} name101 101\n'.format(i))
-        lines.insert(-1, '{0} name102 1 02\n'.format(i))
-        lines.insert(-1, '{0} "name103" 1 03\n'.format(i))
-        lines.insert(-1, '{0} name104 "1"  04\n'.format(i))
-        lines.insert(-1, '{0} name105 1 \'05\'\n'.format(i))
-        lines.insert(-1, '{0} name106 1 \'0\'   6\n'.format(i))
-        lines.insert(-1, '{0} name107 1 0\ 7\n'.format(i))
-        lines.insert(-1, '{0} name108 "with = in value"\n'.format(i))
-        dfparser.lines = lines
+        ('name101 101', {'name101': '101'}),
+        ('name102 1 02', {'name102': '1 02'}),
+        ('"name103" 1 03', {'name103': '1 03'}),
+        ('name104 "1"  04', {'name104': '1  04'}),
+        ('name105 1 \'05\'', {'name105': '1 05'}),
+        ('name106 1 \'0\'   6', {'name106': '1 0   6'}),
+        ('name107 1 0\ 7', {'name107': '1 0 7'}),
+        ('name108 "with = in value"', {'name108': 'with = in value'}),
+        ('name109 "\\"quoted\\""', {'name109': '"quoted"'}),
+    ])
+    def test_get_instructions_from_df(self, dfparser, instruction, instr_value,
+                                      expected):
+        dfparser.content = "{0} {1}\n".format(instruction, instr_value)
         if instruction == 'LABEL':
             instructions = dfparser.labels
         elif instruction == 'ENV':
             instructions = dfparser.envs
-        assert len(instructions) == 22
-        assert instructions.get('name1') == 'value 1'
-        assert instructions.get('name2') == 'myself'
-        assert instructions.get('name3') == ''
-        assert instructions.get('name5') == '5'
-        assert instructions.get('name6') == '6'
-        assert instructions.get('name7') == ''
-        assert instructions.get('name8') == ''
-        assert instructions.get('name9') == 'asd \\  \\n qwe'
-        assert instructions.get('name10') == '{0}'.format(NON_ASCII)
-        assert instructions.get('name1 1') == '1'
-        assert instructions.get('name12') == '12'
-        assert instructions.get('name13') == '13'
-        assert instructions.get('name14') == '1 4'
-        assert instructions.get('name15') == 'with = in value'
-        assert instructions.get('name101') == '101'
-        assert instructions.get('name102') == '1 02'
-        assert instructions.get('name103') == '1 03'
-        assert instructions.get('name104') == '1  04'
-        assert instructions.get('name105') == '1 05'
-        assert instructions.get('name106') == '1 0   6'
-        assert instructions.get('name107') == '1 0 7'
-        assert instructions.get('name108') == 'with = in value'
+
+        assert instructions == expected
+
+    @pytest.mark.parametrize(('from_value', 'expect'), [
+        (
+            "    ",
+            (None, None),
+        ), (
+            "   foo",
+            ('foo', None),
+        ), (
+            "foo:bar as baz   ",
+            ('foo:bar', 'baz'),
+        ), (
+            "foo as baz",
+            ('foo', 'baz'),
+        ), (
+            "foo and some other junk",  # we won't judge
+            ('foo', None),
+        ), (
+            "registry.example.com:5000/foo/bar:baz",
+            ('registry.example.com:5000/foo/bar:baz', None),
+        )
+    ])
+    def test_image_from(self, from_value, expect):
+        result = image_from(from_value)
+        assert result == expect
+
+    def test_parent_images(self, dfparser):
+        FROM = ('my-builder:latest', 'rhel7:7.5')
+        template = dedent("""\
+            FROM {0} AS builder
+            CMD do some stuff
+
+            FROM {1}
+            COPY --from=builder some stuff
+            """)
+        dfparser.content = template.format(*FROM)
+
+        parents = dfparser.parent_images
+        assert parents == list(FROM)
+
+        NEW_FROM = ('my-builder@sha256:1234abcd...', 'rhel7@sha256:1234abcd...')
+        dfparser.parent_images = NEW_FROM
+        assert dfparser.content == template.format(*NEW_FROM)
+
+        with pytest.raises(RuntimeError):
+            dfparser.parent_images = [1]
+        with pytest.raises(RuntimeError):
+            dfparser.parent_images = [1, 2, "many"]
+
+    def test_parent_images_missing_from(self, dfparser):
+        dfparser.content = dedent("""\
+            # even though this would be really broken
+            FROM
+            FROM first AS foo
+            FROM
+            FROM second
+            """)
+        assert dfparser.parent_images == ['first', 'second']
+        assert dfparser.baseimage == 'second'
+        dfparser.parent_images = ['spam', 'eggs']
+        assert dfparser.parent_images == ['spam', 'eggs']
+        # remains just as broken
+        assert dfparser.content.count('FROM') == 4
 
     def test_modify_instruction(self, dfparser):
         FROM = ('ubuntu', 'fedora:latest')
@@ -239,12 +339,12 @@ class TestDockerfileParser(object):
 
     def test_modify_from_multistage(self, dfparser):
         BASE_FROM = 'base:${CODE_VERSION}'
-        STAGED_FROM = 'extras:${CODE_VERSION}'
+        BUILDER_FROM = 'builder:${CODE_VERSION}'
         UPDATED_BASE_FROM = 'bass:${CODE_VERSION}'
 
-        BASE_CMD = '/code/run-app'
-        STAGED_CMD = '/code/run-extras'
-        UPDATED_STAGED_CMD = '/code/run-main-actors'
+        BASE_CMD = None
+        BUILDER_CMD = '/code/run-extras'
+        UPDATED_BASE_CMD = '/code/run-main-actors'
 
         df_content = dedent("""\
             ARG  CODE_VERSION=latest
@@ -252,7 +352,7 @@ class TestDockerfileParser(object):
             CMD {1}
 
             FROM {2}
-            CMD {3}""").format(BASE_FROM, BASE_CMD, STAGED_FROM, STAGED_CMD)
+            """).format(BUILDER_FROM, BUILDER_CMD, BASE_FROM)
 
         INDEX_FIRST_FROM = 1
         INDEX_SECOND_FROM = 4
@@ -263,28 +363,23 @@ class TestDockerfileParser(object):
         dfparser.content = df_content
 
         assert dfparser.baseimage == BASE_FROM
-        assert dfparser.lines[INDEX_FIRST_FROM].strip() == 'FROM {0}'.format(BASE_FROM)
-        assert dfparser.lines[INDEX_SECOND_FROM].strip() == 'FROM {0}'.format(STAGED_FROM)
+        assert dfparser.lines[INDEX_FIRST_FROM].strip() == 'FROM {0}'.format(BUILDER_FROM)
+        assert dfparser.lines[INDEX_SECOND_FROM].strip() == 'FROM {0}'.format(BASE_FROM)
 
-        assert dfparser.cmd == STAGED_CMD  # Last command overrides base command
-        assert dfparser.lines[INDEX_FIRST_CMD].strip() == 'CMD {0}'.format(BASE_CMD)
-        assert dfparser.lines[INDEX_SECOND_CMD].strip() == 'CMD {0}'.format(STAGED_CMD)
-
-        dfparser.baseimage = UPDATED_BASE_FROM
+        dfparser.baseimage = UPDATED_BASE_FROM  # should update only last FROM
         assert dfparser.baseimage == UPDATED_BASE_FROM
-        assert dfparser.lines[INDEX_FIRST_FROM].strip() == 'FROM {0}'.format(UPDATED_BASE_FROM)
-        assert dfparser.lines[INDEX_SECOND_FROM].strip() == 'FROM {0}'.format(STAGED_FROM)
+        assert dfparser.lines[INDEX_FIRST_FROM].strip() == 'FROM {0}'.format(BUILDER_FROM)
+        assert dfparser.lines[INDEX_SECOND_FROM].strip() == 'FROM {0}'.format(UPDATED_BASE_FROM)
 
-        assert dfparser.cmd == STAGED_CMD  # Last command overrides base command
-        assert dfparser.lines[INDEX_FIRST_CMD].strip() == 'CMD {0}'.format(BASE_CMD)
-        assert dfparser.lines[INDEX_SECOND_CMD].strip() == 'CMD {0}'.format(STAGED_CMD)
+        assert dfparser.cmd == BASE_CMD  # Last stage command is the base command; None, initially
+        assert dfparser.lines[INDEX_FIRST_CMD].strip() == 'CMD {0}'.format(BUILDER_CMD)
+        assert len(dfparser.lines) == INDEX_SECOND_CMD
 
-        # Unlike FROM, updates to CMD should update all instructions. Might need
-        # revisiting for additional support of multistage builds.
-        dfparser.cmd = UPDATED_STAGED_CMD
-        assert dfparser.cmd == UPDATED_STAGED_CMD
-        assert dfparser.lines[INDEX_FIRST_CMD].strip() == 'CMD {0}'.format(UPDATED_STAGED_CMD)
-        assert dfparser.lines[INDEX_SECOND_CMD].strip() == 'CMD {0}'.format(UPDATED_STAGED_CMD)
+        # Like FROM, updates to CMD should update only the CMD in the final stage.
+        dfparser.cmd = UPDATED_BASE_CMD
+        assert dfparser.cmd == UPDATED_BASE_CMD
+        assert dfparser.lines[INDEX_FIRST_CMD].strip() == 'CMD {0}'.format(BUILDER_CMD)
+        assert dfparser.lines[INDEX_SECOND_CMD].strip() == 'CMD {0}'.format(UPDATED_BASE_CMD)
 
     def test_add_del_instruction(self, dfparser):
         df_content = dedent("""\
@@ -348,7 +443,7 @@ class TestDockerfileParser(object):
          'first',
          ['a b\n',
           'x="y z"\n',
-          'second=second\n']),
+          '"second"="second"\n']),
 
         #  Remove second of two instructions on the same line
         (['a b\n',
@@ -357,7 +452,7 @@ class TestDockerfileParser(object):
          'second',
          ['a b\n',
           'x="y z"\n',
-          'first=first\n']),
+          '"first"="first"\n']),
     ])
     def test_delete_instruction(self, dfparser, instruction, existing, delete_key, expected):
         existing = [instruction + ' ' + i for i in existing]
@@ -401,7 +496,7 @@ class TestDockerfileParser(object):
           'first=\'first value\' "second"=second\n',
           'x="y z"\n'],
          {'first': 'changed', 'second': 'second'},
-         ['first=changed second=second\n']),
+         ['first=changed "second"=second\n']),
 
         # Delete one label of a multi-value LABEL/ENV statement
         (['a b\n',
@@ -413,8 +508,8 @@ class TestDockerfileParser(object):
         # Nested quotes
         (['"ownership"="Alice\'s label" other=value\n'],
          {'ownership': "Alice's label"},
-         # quote() will always use single quotes when it can
-         ["ownership='Alice\'\"\'\"\'s label'\n"]),
+         # Keeps existing key quoting style
+         ['"ownership"="Alice\'s label"\n']),
 
         # Modify a single value that needs quoting
         (['foo bar\n'],
@@ -438,16 +533,19 @@ class TestDockerfileParser(object):
     @pytest.mark.parametrize(('old_instructions', 'key', 'new_value', 'expected'), [
         # Simple case, no '=' or quotes
         ('Release 1', 'Release', '2', 'Release 2'),
-        # No '=' but quotes
-        ('"Release" "2"', 'Release', '3', 'Release 3'),
+        # No '=' but quotes (which are kept)
+        ('"Release" "2"', 'Release', '3', '"Release" 3'),
         # Simple case, '=' but no quotes
         ('Release=1', 'Release', '6', 'Release=6'),
-        # '=' and quotes
-        ('"Name"=\'alpha alpha\' Version=1', 'Name', 'beta delta', 'Name=\'beta delta\' Version=1'),
+        # '=' and quotes, with space in the value
+        ('"Name"=\'alpha alpha\' Version=1', 'Name', 'beta delta', '"Name"=\'beta delta\' Version=1'),
+        ('Name=foo', 'Name', 'new value', "Name='new value'"),
+        # ' ' and quotes
+        ('"Name" alpha alpha', 'Name', 'beta delta', "\"Name\" 'beta delta'"),
         # '=', multiple labels, no quotes
         ('Name=foo Release=3', 'Release', '4', 'Name=foo Release=4'),
         # '=', multiple labels and quotes
-        ('Name=\'foo bar\' "Release"="4"', 'Release', '5', 'Name=\'foo bar\' Release=5'),
+        ('Name=\'foo bar\' "Release"="4"', 'Release', '5', 'Name=\'foo bar\' "Release"=5'),
         # Release that's not entirely numeric
         ('Version=1.1', 'Version', '2.1', 'Version=2.1'),
     ])
@@ -475,6 +573,7 @@ class TestDockerfileParser(object):
             del dfparser.envs[key]
             assert not dfparser.labels.get(key)
 
+    @pytest.mark.parametrize('separator', [' ', '='])
     @pytest.mark.parametrize(('label', 'expected'), [
         # Expected substitutions
         ('$V', 'v'),
@@ -485,6 +584,7 @@ class TestDockerfileParser(object):
         ('${V}', 'v'),
         ('${V}-foo', 'v-foo'),
         ('$V-{foo}', 'v-{foo}'),
+        ('$VS', 'spam maps'),
 
         # These should not be substituted, only dequoted
         ("'$V'", "$V"),
@@ -497,12 +597,14 @@ class TestDockerfileParser(object):
         ('${}', ''),
         ("'\\'$V'\\'", "\\v\\"),
     ])
-    def test_env_replace(self, dfparser, label, expected):
+    def test_env_replace(self, dfparser, label, expected, separator):
         dfparser.lines = ["FROM fedora\n",
                           "ENV V=v\n",
-                          "LABEL TEST={0}\n".format(label)]
+                          "ENV VS='spam maps'\n",
+                          "LABEL TEST{0}{1}\n".format(separator, label)]
         assert dfparser.labels['TEST'] == expected
 
+    @pytest.mark.parametrize('separator', [' ', '='])
     @pytest.mark.parametrize(('label', 'expected'), [
         # These would have been substituted with env_replace=True
         ('$V', '$V'),
@@ -511,14 +613,14 @@ class TestDockerfileParser(object):
         ('"$V-foo"', '$V-foo'),
         ('"$V"-foo', '$V-foo'),
     ])
-    def test_env_noreplace(self, dfparser, label, expected):
+    def test_env_noreplace(self, dfparser, label, expected, separator):
         """
         Make sure environment replacement can be disabled.
         """
         dfparser.env_replace = False
         dfparser.lines = ["FROM fedora\n",
                           "ENV V=v\n",
-                          "LABEL TEST={0}\n".format(label)]
+                          "LABEL TEST{0}{1}\n".format(separator, label)]
         assert dfparser.labels['TEST'] == expected
 
     @pytest.mark.parametrize('label', [
@@ -538,6 +640,27 @@ class TestDockerfileParser(object):
             dfparser.labels['TEST']
         except:
             pass
+
+    def test_env_multistage(self, dfparser):
+        dfparser.content = dedent("""\
+            FROM stuff
+            ENV a=keep b=keep
+
+            FROM base
+            ENV a=delete
+            RUN something
+            """)
+
+        dfparser.envs['a'] = "changed"
+        del dfparser.envs['a']
+        dfparser.envs['b'] = "new"
+
+        lines = dfparser.lines
+        assert "ENV" in lines[1]
+        assert "a=keep" in lines[1]
+        assert "b=new" not in lines[1]
+        assert "a=delete" not in dfparser.content
+        assert "b=new" in lines[-1]
 
     @pytest.mark.xfail
     @pytest.mark.parametrize(('label', 'expected'), [
@@ -732,3 +855,196 @@ class TestDockerfileParser(object):
             LABEL component="$NAME$VER"
         """)
         assert dfparser.labels['component'] == 'name1'
+
+    def test_label_env_key(self, dfparser):
+        """
+        Verify keys may be substituted with values containing space.
+
+        Surprisingly, Docker allows environment variable substitution even
+        in the keys of labels, and not only that but it allows them to
+        contain spaces.
+        """
+        dfparser.content = dedent("""\
+            FROM scratch
+            ENV FOOBAR="foo bar"
+            LABEL "$FOOBAR"="baz"
+        """)
+        assert dfparser.labels['foo bar'] == 'baz'
+
+    @pytest.mark.parametrize('value', [
+        'a=b c',
+    ])
+    def test_label_invalid(self, dfparser, value):
+        dfparser.content = '\n'.join([
+            "FROM scratch",
+            "LABEL {0}".format(value),
+        ])
+        with pytest.raises(Exception):
+            dfparser.labels
+
+    def test_add_lines_stages(self, dfparser):
+        dfparser.content = dedent("""\
+            From builder
+            CMD xyz
+            From base
+            LABEL a=b c=d
+            ENV h i
+            """)
+        dfparser.add_lines("something new", all_stages=True)
+        assert "something new" in dfparser.lines[2]
+        assert "something new" in dfparser.lines[-1]
+        assert len([line for line in dfparser.lines if "something new" in line]) == 2
+        assert len(dfparser.lines) == 7
+
+    @pytest.mark.parametrize('at_start', [True, False])
+    def test_add_lines_stages_skip_scratch(self, dfparser, at_start):
+        dfparser.content = dedent("""\
+            From builder
+            CMD xyz
+            From scratch
+            LABEL type=scratch
+            From base
+            LABEL a=b c=d
+            ENV h i
+            From scratch
+            LABEL type=scratch2
+            """)
+        dfparser.add_lines("something new", all_stages=True, skip_scratch=True, at_start=at_start)
+
+        if at_start:
+            assert "something new" in dfparser.lines[1]
+            assert "something new" in dfparser.lines[6]
+        else:
+            assert "something new" in dfparser.lines[2]
+            assert "something new" in dfparser.lines[8]
+        assert len([line for line in dfparser.lines if "something new" in line]) == 2
+        assert len(dfparser.lines) == 11
+
+    def test_add_lines_stage_edge(self, dfparser):
+        dfparser.content = "# no from or newline"
+        dfparser.add_lines("begin with new", at_start=True)
+        dfparser.add_lines("end with new")
+        assert "begin with new" in dfparser.lines[0]
+        assert "end with new" in dfparser.lines[2]
+
+    @pytest.mark.parametrize(('anchor', 'raises'), [
+        (
+            3, None
+        ),
+        (
+            'CMD xyz\n', None
+        ),
+        (
+            dict(
+                content='CMD xyz\n',
+                startline=3,
+                endline=3,
+                instruction='CMD',
+                value='xyz'
+            ),
+            None
+        ),
+        (
+            -2, AssertionError
+        ),
+        (
+            20, AssertionError
+        ),
+        (
+            2.0, RuntimeError
+        ),
+        (
+            'not there', RuntimeError
+        ),
+        (
+            dict(), AssertionError
+        ),
+    ])
+    def test_add_lines_at(self, dfparser, anchor, raises):
+        dfparser.content = dedent("""\
+            From builder
+            CMD xyz
+            LABEL a=b c=d
+            CMD xyz
+            """)
+
+        if raises:
+            with pytest.raises(raises):
+                dfparser.add_lines_at(anchor, "# something new")
+            return
+
+        dfparser.add_lines_at(anchor, "# something new")
+        assert "something new" in dfparser.content
+        assert "something new" not in dfparser.lines[1]
+        assert "something new" in dfparser.lines[3]
+        assert "CMD" in dfparser.lines[4]
+
+    @pytest.mark.parametrize('anchor', [
+        1,
+        'CMD xyz\n',
+        dict(
+            content='CMD xyz\n',
+            startline=1,
+            endline=1,
+            instruction='CMD',
+            value='xyz'
+        ),
+    ])
+    def test_replace_lines_at(self, dfparser, anchor):
+        dfparser.content = dedent("""\
+            From builder
+            CMD xyz
+            LABEL a=b c=d
+            """)
+
+        dfparser.add_lines_at(anchor, "# something new", replace=True)
+        assert "something new" in dfparser.lines[1]
+        assert "CMD" not in dfparser.content
+
+    @pytest.mark.parametrize('anchor', [
+        1,
+        'CMD xyz\n',
+        dict(
+            content='CMD xyz\n',
+            startline=1,
+            endline=1,
+            instruction='CMD',
+            value='xyz'
+        ),
+    ])
+    def test_add_lines_after(self, dfparser, anchor):
+        dfparser.content = dedent("""\
+            From builder
+            CMD xyz
+            LABEL a=b c=d
+            """)
+
+        dfparser.add_lines_at(anchor, "# something new", after=True)
+        assert "something new" in dfparser.lines[2]
+        assert "CMD" in dfparser.lines[1]
+        assert "LABEL" in dfparser.lines[3]
+
+    def test_add_lines_at_edge(self, dfparser):
+        dfparser.content = dedent("""\
+            From builder
+            CMD xyz
+            LABEL a=b c=d""")  # no newline
+        dfparser.add_lines_at(2, "# something new", after=True)
+        assert "d#" not in dfparser.content
+        assert 4 == len(dfparser.lines)
+        assert "something new" in dfparser.lines[3]
+
+    def test_remove_whitespace(self, tmpdir):
+        """
+        Verify keys are parsed correctly even if there is no final newline.
+
+        """
+        with open(os.path.join(str(tmpdir), 'Dockerfile'), 'w') as fp:
+            fp.write('FROM scratch')
+        tmpdir_path = str(tmpdir.realpath())
+        df1 = DockerfileParser(tmpdir_path)
+        df1.labels['foo'] = 'bar'
+
+        df2 = DockerfileParser(tmpdir_path, True)
+        assert df2.baseimage == 'scratch'
+        assert df2.labels['foo'] == 'bar'
