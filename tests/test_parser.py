@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Copyright (c) 2015 Red Hat, Inc
+Copyright (c) 2015, 2019 Red Hat, Inc
 All rights reserved.
 
 This software may be modified and distributed under the terms
@@ -20,6 +20,7 @@ from textwrap import dedent
 
 from dockerfile_parse import DockerfileParser
 from dockerfile_parse.parser import image_from
+from dockerfile_parse.constants import COMMENT_INSTRUCTION
 from tests.fixtures import dfparser, instruction
 
 NON_ASCII = "žluťoučký"
@@ -84,27 +85,48 @@ class TestDockerfileParser(object):
         assert df2.cached_content
 
     def test_dockerfile_structure(self, dfparser):
-        dfparser.lines = ["# comment\n",        # should be ignored
-                          " From  \\\n",        # mixed-case
-                          "   base\n",          # extra ws, continuation line
-                          " # comment\n",
-                          " label  foo  \\\n",  # extra ws
-                          "    # comment\n",    # should be ignored
-                          "    bar  \n",        # extra ws, continuation line
+        dfparser.lines = ["# comment\n",                # single-line comment
+                          " From  \\\n",                # mixed-case
+                          "   base\n",                  # extra ws, continuation line
+                          " #    another   comment\n",  # extra ws
+                          " label  foo  \\\n",          # extra ws
+                          "# interrupt LABEL\n",        # comment interrupting multi-line LABEL
+                          "    bar  \n",                # extra ws, instruction continuation
                           "USER  {0}\n".format(NON_ASCII),
-                          "# comment \\\n",     # extra ws
-                          "# comment \\ \n",    # extra ws with a space
-                          "# comment \\\\ \n",  # two backslashes
+                          "# comment \\\n",             # extra ws
+                          "# with \\ \n",               # extra ws with a space
+                          "# backslashes \\\\ \n",      # two backslashes
+                          "#no space after hash\n",       
+                          "# comment # with hash inside\n",      
                           "RUN command1\n",
                           "RUN command2 && \\\n",
-                          "    # comment\n",
-                          "    command3\n"]
+                          "    command3\n",
+                          "RUN command4 && \\\n",
+                          "# interrupt RUN\n",          # comment interrupting multi-line RUN
+                          "    command5\n",                        
+                        ]
 
-        assert dfparser.structure == [{'instruction': 'FROM',
-                                       'startline': 1,  # 0-based
+        assert dfparser.structure == [
+                                      {'instruction': COMMENT_INSTRUCTION,
+                                       'startline': 0,
+                                       'endline': 0,
+                                       'content': '# comment\n',
+                                       'value': 'comment'},
+                                      {'instruction': 'FROM',
+                                       'startline': 1,
                                        'endline': 2,
                                        'content': ' From  \\\n   base\n',
                                        'value': 'base'},
+                                      {'instruction': COMMENT_INSTRUCTION,
+                                       'startline': 3,
+                                       'endline': 3,
+                                       'content': ' #    another   comment\n',
+                                       'value': 'another   comment'},
+                                      {'instruction': COMMENT_INSTRUCTION,
+                                       'startline': 5,
+                                       'endline': 5,
+                                       'content': '# interrupt LABEL\n',
+                                       'value': 'interrupt LABEL'},
                                       {'instruction': 'LABEL',
                                        'startline': 4,
                                        'endline': 6,
@@ -115,16 +137,51 @@ class TestDockerfileParser(object):
                                        'endline': 7,
                                        'content': 'USER  {0}\n'.format(NON_ASCII),
                                        'value': '{0}'.format(NON_ASCII)},
-                                      {'instruction': 'RUN',
+                                      {'instruction': COMMENT_INSTRUCTION,
+                                       'startline': 8,
+                                       'endline': 8,
+                                       'content': '# comment \\\n',
+                                       'value': 'comment \\'},
+                                      {'instruction': COMMENT_INSTRUCTION,
+                                       'startline': 9,
+                                       'endline': 9,
+                                       'content': '# with \\ \n',
+                                       'value': 'with \\ '},
+                                      {'instruction': COMMENT_INSTRUCTION,
+                                       'startline': 10,
+                                       'endline': 10,
+                                       'content': '# backslashes \\\\ \n',
+                                       'value': 'backslashes \\\\ '},
+                                      {'instruction': COMMENT_INSTRUCTION,
                                        'startline': 11,
                                        'endline': 11,
+                                       'content': '#no space after hash\n',
+                                       'value': 'no space after hash'},
+                                      {'instruction': COMMENT_INSTRUCTION,
+                                       'startline': 12,
+                                       'endline': 12,
+                                       'content': '# comment # with hash inside\n',
+                                       'value': 'comment # with hash inside'},
+                                      {'instruction': 'RUN',
+                                       'startline': 13,
+                                       'endline': 13,
                                        'content': 'RUN command1\n',
                                        'value': 'command1'},
                                       {'instruction': 'RUN',
-                                       'startline': 12,
-                                       'endline': 14,
+                                       'startline': 14,
+                                       'endline': 15,
                                        'content': 'RUN command2 && \\\n    command3\n',
-                                       'value': 'command2 &&     command3'}]
+                                       'value': 'command2 &&     command3'},
+                                      {'instruction': COMMENT_INSTRUCTION,
+                                       'startline': 17,
+                                       'endline': 17,
+                                       'content': '# interrupt RUN\n',
+                                       'value': 'interrupt RUN'},
+                                      {'instruction': 'RUN',
+                                       'startline': 16,
+                                       'endline': 18,
+                                       'content': 'RUN command4 && \\\n    command5\n',
+                                       'value': 'command4 &&     command5'}]
 
     def test_dockerfile_json(self, dfparser):
         dfparser.content = dedent("""\
@@ -132,7 +189,8 @@ class TestDockerfileParser(object):
             From  base
             LABEL foo="bar baz"
             USER  {0}""").format(NON_ASCII)
-        expected = json.dumps([{"FROM": "base"},
+        expected = json.dumps([{"COMMENT": "comment"},
+                               {"FROM": "base"},
                                {"LABEL": "foo=\"bar baz\""},
                                {"USER": "{0}".format(NON_ASCII)}])
         assert dfparser.json == expected
@@ -871,16 +929,34 @@ class TestDockerfileParser(object):
         """)
         assert dfparser.labels['foo bar'] == 'baz'
 
-    @pytest.mark.parametrize('value', [
-        'a=b c',
+    @pytest.mark.parametrize('label_value, bad_keyval, envs', [
+        ('a=b c', 'c', None),
+        # if variable substitution was done too early, this could be an issue
+        ('a=1 $CHEEKY_VARIABLE', '$CHEEKY_VARIABLE', {'CHEEKY_VARIABLE': 'b=2'})
     ])
-    def test_label_invalid(self, dfparser, value):
-        dfparser.content = '\n'.join([
-            "FROM scratch",
-            "LABEL {0}".format(value),
-        ])
-        with pytest.raises(Exception):
-            dfparser.labels
+    @pytest.mark.parametrize('action', ['get', 'set'])
+    def test_label_invalid(self, dfparser, label_value, bad_keyval, envs, action):
+        if envs:
+            env_vals = ('{0}="{1}"'.format(k, v) for k, v in envs.items())
+            env_line = 'ENV {values}\n'.format(values=' '.join(env_vals))
+        else:
+            env_line = ''
+
+        dfparser.lines = [
+            "FROM scratch\n",
+            env_line,   # has to appear before the LABEL line
+            "LABEL {0}\n".format(label_value),
+        ]
+        with pytest.raises(ValueError) as exc_info:
+            if action == 'get':
+                dfparser.labels
+            elif action == 'set':
+                dfparser.labels = {}
+
+        msg = str(exc_info.value)
+        assert msg == ('Syntax error - can\'t find = in "{word}". '
+                       'Must be of the form: name=value'
+                       .format(word=bad_keyval))
 
     def test_add_lines_stages(self, dfparser):
         dfparser.content = dedent("""\
@@ -1033,6 +1109,38 @@ class TestDockerfileParser(object):
         assert "d#" not in dfparser.content
         assert 4 == len(dfparser.lines)
         assert "something new" in dfparser.lines[3]
+
+    def test_add_lines_after_continuation(self, dfparser):
+        dfparser.content = dedent("""\
+            FROM builder
+            RUN touch foo; \\
+                touch bar
+            """)
+
+        fromline = dfparser.structure[1]
+        assert fromline['instruction'] == 'RUN'
+        dfparser.add_lines_at(fromline, "# something new", after=True)
+        assert dfparser.lines == [
+            "FROM builder\n",
+            "RUN touch foo; \\\n",
+            "    touch bar\n",
+            "# something new\n",
+        ]
+
+    def test_replace_lines_continuation(self, dfparser):
+        dfparser.content = dedent("""\
+            FROM builder
+            RUN touch foo; \\
+                touch bar
+            """)
+
+        fromline = dfparser.structure[1]
+        assert fromline['instruction'] == 'RUN'
+        dfparser.add_lines_at(fromline, "# something new", replace=True)
+        assert dfparser.lines == [
+            "FROM builder\n",
+            "# something new\n",
+        ]
 
     def test_remove_whitespace(self, tmpdir):
         """

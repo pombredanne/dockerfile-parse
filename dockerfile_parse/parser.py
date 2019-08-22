@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Copyright (c) 2015, 2018 Red Hat, Inc
+Copyright (c) 2015, 2018, 2019 Red Hat, Inc
 All rights reserved.
 
 This software may be modified and distributed under the terms
@@ -16,7 +16,7 @@ import re
 from contextlib import contextmanager
 from six import string_types
 
-from .constants import DOCKERFILE_FILENAME
+from .constants import DOCKERFILE_FILENAME, COMMENT_INSTRUCTION
 from .util import (b2u, extract_labels_or_envs, get_key_val_dictionary,
                    u2b, Context, WordSplitter)
 
@@ -216,8 +216,6 @@ class DockerfileParser(object):
              "content": "CMD yum -y update && \\\n    yum clean all\n",
              "value": "yum -y update && yum clean all"}
         ]
-
-        Comments are ignored.
         """
         def _rstrip_backslash(l):
             l = l.rstrip()
@@ -225,37 +223,62 @@ class DockerfileParser(object):
                 return l[:-1]
             return l
 
+        def _create_instruction_dict(instruction=None, value=None):
+            return {
+                'instruction': instruction,
+                'startline': lineno,
+                'endline': lineno,
+                'content': line,
+                'value': value
+            }
+
+        def _clean_comment_line(line):
+            line = re.sub('^\s*#\s*', '', line)
+            line = re.sub('\n', '', line)
+            return line
+
+
         instructions = []
         lineno = -1
         insnre = re.compile(r'^\s*(\w+)\s+(.*)$')  # matched group is insn
         contre = re.compile(r'^.*\\\s*$')          # line continues?
         commentre = re.compile(r'^\s*#')           # line is a comment?
+        
         in_continuation = False
         current_instruction = None
+
         for line in self.lines:
             lineno += 1
-            if commentre.match(line):
-                continue
-            if not in_continuation:
-                m = insnre.match(line)
-                if not m:
-                    continue
-                current_instruction = {'instruction': m.groups()[0].upper(),
-                                       'startline': lineno,
-                                       'endline': lineno,
-                                       'content': line,
-                                       'value': _rstrip_backslash(m.groups()[1])}
-            else:
-                current_instruction['content'] += line
-                current_instruction['endline'] = lineno
-                if current_instruction['value']:
-                    current_instruction['value'] += _rstrip_backslash(line)
-                else:
-                    current_instruction['value'] = _rstrip_backslash(line.lstrip())
 
-            in_continuation = contre.match(line)
-            if not in_continuation and current_instruction is not None:
-                instructions.append(current_instruction)
+            # It is necessary to keep instructions and comment parsing separate,
+            # as a multi-line instruction can be interjected with comments.
+            if commentre.match(line):
+                comment = _create_instruction_dict(
+                    instruction=COMMENT_INSTRUCTION,
+                    value=_clean_comment_line(line)
+                )
+                instructions.append(comment)
+
+            else:
+                if not in_continuation:
+                    m = insnre.match(line)
+                    if not m:
+                        continue
+                    current_instruction = _create_instruction_dict(
+                        instruction=m.groups()[0].upper(), 
+                        value=_rstrip_backslash(m.groups()[1])
+                    )
+                else:
+                    current_instruction['content'] += line
+                    current_instruction['endline'] = lineno
+                    if current_instruction['value']:
+                        current_instruction['value'] += _rstrip_backslash(line)
+                    else:
+                        current_instruction['value'] = _rstrip_backslash(line.lstrip())
+
+                in_continuation = contre.match(line)
+                if not in_continuation and current_instruction is not None:
+                    instructions.append(current_instruction)
 
         return instructions
 
@@ -656,7 +679,10 @@ class DockerfileParser(object):
             assert anchor in self.structure, "Current structure does not match: {0}".format(anchor)
             if replace:
                 df_lines[anchor['startline']:anchor['endline'] + 1] = []
-            anchor = anchor['startline']
+            if after:
+                anchor = anchor['endline']
+            else:
+                anchor = anchor['startline']
         elif isinstance(anchor, string_types):  # line contents
             matches = [index for index, text in enumerate(df_lines) if text == anchor]
             if not matches:
